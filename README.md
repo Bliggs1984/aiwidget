@@ -42,6 +42,13 @@ command has ended shows on its own row, and that command doesn't get a "done" ro
 within one refresh and leaves a brand-new process running. A task that was past the row limit
 when it finished never shows as done.
 
+## Privacy
+
+The panel shows what agents run, so values that look secret are hidden as `•••`: passwords and
+keys in flags and variables (`--token`, `API_KEY=`), `Authorization` and `Cookie` headers, logins
+in URLs, and well-known key formats. This works from patterns, so a secret with no telling name
+or shape can still appear. Keep that in mind before sharing a screenshot.
+
 ## Performance
 
 Speed comes first, so there is no GPU use, no animation loop and no background thread.
@@ -87,6 +94,9 @@ to `%USERPROFILE%\.claude\settings.json`:
 The hook only appends a line to `%LOCALAPPDATA%\aiwidget\hook-log.jsonl` and always exits
 cleanly, so it can't block Claude.
 
+**Before turning it on:** that file stores each command in full and in plain text, including any
+password or key in it. The masking above only affects what the panel shows, not this file.
+
 ## Build
 
 Needs Rust (`rustup`) and the Visual Studio C++ Build Tools.
@@ -106,6 +116,7 @@ For debugging: set `AIWIDGET_DEBUG=1` to log timings to `%TEMP%\aiwidget-debug.l
 | `src/procs.rs` | Reads the process list, CPU, memory, command lines, working folders |
 | `src/agents.rs` | Recognises agents and groups their child processes into tasks |
 | `src/describe.rs` | Unwraps shell wrappers and turns commands into plain English |
+| `src/redact.rs` | Hides secret-looking values in commands before they are shown |
 | `src/render.rs` | Lays out the panel, draws the smoke background and the text |
 | `src/main.rs` | Window, timer, right-click menu, dragging, screen placement |
 | `src/screens.rs` | Lists the screens |
