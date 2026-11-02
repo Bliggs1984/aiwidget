@@ -10,6 +10,7 @@ mod config;
 mod describe;
 mod hooklog;
 mod procs;
+mod redact;
 mod render;
 mod screens;
 

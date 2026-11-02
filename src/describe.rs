@@ -99,9 +99,26 @@ fn strip_outer_quotes(s: &str) -> String {
     }
 }
 
+/// Far longer than anything we show, and it bounds the work: a command line can be 32 KB and
+/// is looked at every refresh.
+const MAX_COMMAND_BYTES: usize = 8 * 1024;
+/// How many times `describe` will look inside a shell it finds in the command.
+const MAX_DESCRIBE_DEPTH: usize = 3;
+
+fn cut(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// The command the agent actually asked to run, with wrappers removed.
 pub fn effective_command(cmdline: &str) -> String {
-    let mut cur = cmdline.trim().to_string();
+    let mut cur = cut(cmdline, MAX_COMMAND_BYTES).trim().to_string();
     for _ in 0..4 {
         let next = unwrap_once(&cur);
         match next {
@@ -340,6 +357,10 @@ pub fn mcp_name(cmd: &str) -> Option<String> {
 
 /// Short plain-English description of an (already unwrapped) command.
 pub fn describe(cmd: &str) -> String {
+    describe_at(cmd, 0)
+}
+
+fn describe_at(cmd: &str, depth: usize) -> String {
     let seg = first_real_segment(cmd);
     let toks = tokenize(&seg);
     let Some(first) = toks.first() else { return "Shell command".into() };
@@ -352,10 +373,10 @@ pub fn describe(cmd: &str) -> String {
         return format!("MCP server: {name}");
     }
     // A shell inside the command (e.g. `powershell -Command "..."`): describe what it runs.
-    if matches!(prog.as_str(), "powershell" | "pwsh" | "cmd" | "bash" | "sh") {
+    if depth < MAX_DESCRIBE_DEPTH && matches!(prog.as_str(), "powershell" | "pwsh" | "cmd" | "bash" | "sh") {
         let inner = effective_command(&seg);
         if inner != seg && !inner.is_empty() {
-            return describe(&inner);
+            return describe_at(&inner, depth + 1);
         }
     }
 
@@ -599,6 +620,30 @@ EOF"), None);
         assert_eq!(describe(c), "Inspecting running processes");
         assert_eq!(describe("cat > /c/x/a.ps1 <<'EOF'"), "Writing a file");
         assert_eq!(describe("cat README.md"), "Reading files");
+    }
+
+    /// The longest command line Windows allows, as nested as it can get. Before the limits this
+    /// took over a second, on the thread that runs the widget, at every refresh. The time limit
+    /// is loose so a busy machine doesn't fail it.
+    #[test]
+    fn deeply_nested_shells_stay_cheap() {
+        let cmd = format!("{}echo hi", "bash -c ".repeat(4090));
+        let started = std::time::Instant::now();
+        let eff = effective_command(&cmd);
+        assert!(eff.len() <= MAX_COMMAND_BYTES);
+        assert!(!describe(&eff).is_empty());
+        assert!(started.elapsed().as_millis() < 300, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_few_nested_shells_are_still_unwrapped() {
+        assert_eq!(describe(&effective_command("bash -c bash -c bash -c bash -c bash -c cargo build")), "Compiling Rust");
+    }
+
+    #[test]
+    fn long_commands_are_cut_safely_inside_a_multibyte_character() {
+        let cmd = "é".repeat(MAX_COMMAND_BYTES);
+        assert!(effective_command(&cmd).len() <= MAX_COMMAND_BYTES);
     }
 
     #[test]

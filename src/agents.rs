@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::describe;
 use crate::procs::{self, EnvInfo, Proc};
+use crate::redact::redact;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AgentKind {
@@ -538,21 +539,24 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 eff = hp.name.trim_end_matches(".exe").to_string();
             }
 
-            if let Some(name) = describe::mcp_name(&eff) {
+            // Everything that can be displayed comes from this masked copy. The hook's own
+            // descriptions are keyed by the original text, so only that lookup uses `eff`.
+            let shown = redact(&eff);
+            if let Some(name) = describe::mcp_name(&shown) {
                 mcps.push(Mcp { name, mem: tmem, cpu: tcpu });
                 continue;
             }
 
             let title = hooks
                 .get(eff.trim())
-                .cloned()
-                .or_else(|| hooks.iter().find(|(c, _)| eff.contains(c.as_str()) && c.len() > 8).map(|(_, d)| d.clone()))
-                .unwrap_or_else(|| describe::describe(&eff));
+                .or_else(|| hooks.iter().find(|(c, _)| eff.contains(c.as_str()) && c.len() > 8).map(|(_, d)| d))
+                .map(|d| redact(d))
+                .unwrap_or_else(|| describe::describe(&shown));
             tasks.push(Task {
                 pid: hp.pid,
                 create_time: hp.create_time,
                 title,
-                detail: describe::without_setup(&eff).split_whitespace().collect::<Vec<_>>().join(" "),
+                detail: describe::without_setup(&shown).split_whitespace().collect::<Vec<_>>().join(" "),
                 cpu: tcpu,
                 mem: tmem,
                 io: tio,
@@ -966,6 +970,28 @@ mod tests {
         // Nothing to go on.
         let none = vec![p(CLAUDE, 1, "claude.exe", 100, 0.0), p(400, 999, "python.exe", 400, 25.0)];
         assert!(sessions(&none, &[])[0].tasks.is_empty());
+    }
+
+    #[test]
+    fn secrets_do_not_reach_the_panel() {
+        let list = vec![p(CLAUDE, 1, "claude.exe", 100, 0.0), p(200, CLAUDE, "bash.exe", 200, 0.0), p(300, CLAUDE, "bash.exe", 300, 0.0)];
+        let mut cache = InfoCache::default();
+        seed(&mut cache, &list, &[]);
+        let curl = r#"bash -c "curl -H 'Authorization: Bearer SECRET-ONE' https://me:SECRET-TWO@x.dev?token=SECRET-THREE""#;
+        cache.map.get_mut(&(200, 200)).unwrap().cmd = Some(Some(curl.to_string()));
+        cache.map.get_mut(&(300, 300)).unwrap().cmd = Some(Some("npx -y @x/mcp-server --api-key SECRET-FOUR".to_string()));
+
+        let s = &build_sessions(&list, &mut cache, &HashMap::new(), 0)[0];
+        let shown = format!("{:?} {:?}", s.tasks, s.mcps);
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert_eq!(s.tasks.len(), 1, "{shown}");
+        assert_eq!(s.mcps.len(), 1, "{shown}");
+
+        // A description from the hook is still matched, and is masked too.
+        let cmd = r#"curl -H 'Authorization: Bearer SECRET-ONE' https://me:SECRET-TWO@x.dev?token=SECRET-THREE"#;
+        let hooks = HashMap::from([(cmd.to_string(), "Calling the API with token=SECRET-FIVE".to_string())]);
+        let s = &build_sessions(&list, &mut cache, &hooks, 0)[0];
+        assert_eq!(s.tasks[0].title, "Calling the API with token=•••");
     }
 
     #[test]
