@@ -551,7 +551,7 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 .get(eff.trim())
                 .or_else(|| hooks.iter().find(|(c, _)| eff.contains(c.as_str()) && c.len() > 8).map(|(_, d)| d))
                 .map(|d| redact(d))
-                .unwrap_or_else(|| describe::describe(&shown));
+                .unwrap_or_else(|| redact(&describe::describe(&shown)));
             tasks.push(Task {
                 pid: hp.pid,
                 create_time: hp.create_time,
@@ -992,6 +992,23 @@ mod tests {
         let hooks = HashMap::from([(cmd.to_string(), "Calling the API with token=SECRET-FIVE".to_string())]);
         let s = &build_sessions(&list, &mut cache, &hooks, 0)[0];
         assert_eq!(s.tasks[0].title, "Calling the API with token=•••");
+    }
+
+    /// A nested encoded PowerShell command is only decoded while writing the title, after the
+    /// command text was masked, so the title has to be masked as well.
+    #[test]
+    fn secrets_decoded_while_describing_do_not_reach_the_title() {
+        use base64::Engine;
+        let inner: Vec<u8> = "tool --password SECRET-ONE".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+        let list = vec![p(CLAUDE, 1, "claude.exe", 100, 0.0), p(200, CLAUDE, "bash.exe", 200, 0.0)];
+        let mut cache = InfoCache::default();
+        seed(&mut cache, &list, &[]);
+        let cmd = format!("cd /x && powershell -EncodedCommand {b64}");
+        cache.map.get_mut(&(200, 200)).unwrap().cmd = Some(Some(cmd));
+        let s = &build_sessions(&list, &mut cache, &HashMap::new(), 0)[0];
+        assert_eq!(s.tasks.len(), 1);
+        assert!(!s.tasks[0].title.contains("SECRET"), "{}", s.tasks[0].title);
     }
 
     #[test]

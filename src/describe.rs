@@ -5,6 +5,7 @@
 //! so we are left with the command the agent actually asked for.
 //! Step 2 (`describe`): match that command against a table of known tools.
 
+use crate::redact::redact;
 use base64::Engine;
 
 /// Lower-cased file name of a program token, without quotes, path or `.exe`.
@@ -374,7 +375,8 @@ fn describe_at(cmd: &str, depth: usize) -> String {
     }
     // A shell inside the command (e.g. `powershell -Command "..."`): describe what it runs.
     if depth < MAX_DESCRIBE_DEPTH && matches!(prog.as_str(), "powershell" | "pwsh" | "cmd" | "bash" | "sh") {
-        let inner = effective_command(&seg);
+        // This can decode text the caller never saw, so it has to be masked here.
+        let inner = redact(&effective_command(&seg));
         if inner != seg && !inner.is_empty() {
             return describe_at(&inner, depth + 1);
         }

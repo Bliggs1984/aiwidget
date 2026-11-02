@@ -11,7 +11,7 @@ pub fn redact(text: &str) -> String {
     let s = mask_url_logins(text);
     let s = mask_headers(&s);
     let s = mask_assignments(&s);
-    let s = mask_flag_values(&s);
+    let s = mask_flag_values(&s, 0);
     mask_token_shapes(&s)
 }
 
@@ -66,6 +66,12 @@ fn mask_headers(s: &str) -> String {
         out = mask_after(&out, name, |rest| {
             let b = rest.as_bytes();
             let start = b.iter().position(|c| *c != b' ').unwrap_or(b.len());
+            let quoted = b.get(start).is_some_and(|c| is_quote(*c))
+                || (b.get(start) == Some(&b'\\') && b.get(start + 1).is_some_and(|c| is_quote(*c)));
+            if quoted {
+                return (start, value_end(b, start, false));
+            }
+            // Unquoted, the value runs to the quote around the whole header, if there is one.
             let end = b[start..].iter().position(|c| is_quote(*c) || *c == b'\n').map_or(b.len(), |e| start + e);
             (start, end)
         });
@@ -100,17 +106,44 @@ fn mask_after(s: &str, name: &str, span: impl Fn(&str) -> (usize, usize)) -> Str
     out
 }
 
-/// The end of the value starting at `start`: its closing quote if it has one, otherwise the
-/// next whitespace or, when `stops` says so, a shell or URL separator.
+/// The end of the value starting at `start`. A quoted one (`"a b"`, or `\"a b\"` inside an
+/// outer quoted string) runs to its closing quote, skipping escaped characters. Otherwise it
+/// runs to the next whitespace or, when `stops` says so, a shell or URL separator.
 fn value_end(b: &[u8], start: usize, stops: bool) -> usize {
-    if start < b.len() && is_quote(b[start]) {
-        return b[start + 1..].iter().position(|c| *c == b[start]).map_or(b.len(), |e| start + 1 + e + 1);
+    let escaped_open = b.get(start) == Some(&b'\\') && b.get(start + 1).is_some_and(|c| is_quote(*c));
+    let open = if escaped_open { start + 1 } else { start };
+    if open < b.len() && is_quote(b[open]) {
+        let mut i = open + 1;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                if escaped_open && b.get(i + 1) == Some(&b[open]) {
+                    return i + 2;
+                }
+                i += 2;
+            } else if b[i] == b[open] {
+                return i + 1;
+            } else {
+                i += 1;
+            }
+        }
+        return b.len();
     }
-    let stop = |c: u8| c.is_ascii_whitespace() || (stops && (is_quote(c) || matches!(c, b'&' | b';' | b'|' | b')')));
-    b[start..].iter().position(|c| stop(*c)).map_or(b.len(), |e| start + e)
+    let mut i = start;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+        } else if c.is_ascii_whitespace() || (stops && (is_quote(c) || matches!(c, b'&' | b';' | b'|' | b')' | b'}' | b','))) {
+            return i;
+        } else {
+            i += 1;
+        }
+    }
+    b.len()
 }
 
-/// `API_KEY=abc`, `--token=abc`, `$env:TOKEN = "abc"` and `?token=abc` hide the value.
+/// `API_KEY=abc`, `--token=abc`, `$env:TOKEN = "abc"`, `?token=abc`, `password: abc` and
+/// `{"token":"abc"}` hide the value.
 fn mask_assignments(s: &str) -> String {
     let b = s.as_bytes();
     let is_name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
@@ -118,24 +151,50 @@ fn mask_assignments(s: &str) -> String {
     let mut copied = 0;
     let mut i = 0;
     while i < b.len() {
-        if b[i] != b'=' || b.get(i + 1) == Some(&b'=') || (i > 0 && matches!(b[i - 1], b'=' | b'!' | b'<' | b'>')) {
+        let prev = if i > 0 { b[i - 1] } else { 0 };
+        let next = b.get(i + 1).copied().unwrap_or(0);
+        let separator = match b[i] {
+            b'=' => next != b'=' && !matches!(prev, b'=' | b'!' | b'<' | b'>'),
+            // Not `::` or `://`, and `:=` is handled when we reach its `=`.
+            b':' => !matches!(next, b':' | b'=' | b'/') && prev != b':',
+            _ => false,
+        };
+        if !separator {
             i += 1;
             continue;
         }
+        // Step back to the name: over spaces, then the `:` of `:=`, then a closing quote.
         let mut name_end = i;
         while name_end > 0 && b[name_end - 1] == b' ' {
             name_end -= 1;
         }
+        if b[i] == b'=' && name_end > 0 && b[name_end - 1] == b':' {
+            name_end -= 1;
+        }
+        while name_end > 0 && b[name_end - 1] == b' ' {
+            name_end -= 1;
+        }
+        if name_end > 0 && is_quote(b[name_end - 1]) {
+            name_end -= 1;
+            if name_end > 0 && b[name_end - 1] == b'\\' {
+                name_end -= 1;
+            }
+        }
         let mut name_start = name_end;
         while name_start > 0 && is_name(b[name_start - 1]) {
             name_start -= 1;
+        }
+        // Check the name first. Measuring every value would make long text very slow.
+        if !is_secret_name(&s[name_start..name_end]) {
+            i += 1;
+            continue;
         }
         let mut start = i + 1;
         while start < b.len() && b[start] == b' ' {
             start += 1;
         }
         let end = value_end(b, start, true);
-        if end > start && is_secret_name(&s[name_start..name_end]) && !s[start..].starts_with(MASK) {
+        if end > start && !s[start..].starts_with(MASK) {
             out.push_str(&s[copied..start]);
             out.push_str(MASK);
             copied = end;
@@ -148,8 +207,14 @@ fn mask_assignments(s: &str) -> String {
     out
 }
 
-/// `--password abc`, `-ApiKey abc`, `curl -u name:abc` and `sshpass -p abc` hide the value.
-fn mask_flag_values(s: &str) -> String {
+/// How many layers of quotes `mask_flag_values` looks inside. It has no reason to go deep, and
+/// a long run of nested quotes mustn't be able to overflow the stack.
+const MAX_QUOTE_DEPTH: usize = 4;
+
+/// `--password abc`, `-ApiKey abc`, `curl -u name:abc` and `sshpass -p abc` hide the value,
+/// including when the whole command is inside quotes: `ssh host "tool --password abc"`.
+fn mask_flag_values(s: &str, depth: usize) -> String {
+    let is_wrapping = |c: char| matches!(c, '"' | '\'' | '\\');
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
@@ -160,8 +225,21 @@ fn mask_flag_values(s: &str) -> String {
             i += 1;
             continue;
         }
-        let end = value_end(b, i, false);
-        let word = &s[i..end];
+        let end = value_end(b, i, false).min(b.len());
+        let raw = &s[i..end];
+        let word = raw.trim_matches(is_wrapping);
+        if word.contains(|c: char| c.is_ascii_whitespace()) {
+            // A quoted string with several words: treat what's inside as a command.
+            if depth < MAX_QUOTE_DEPTH {
+                let inner_start = i + (raw.len() - raw.trim_start_matches(is_wrapping).len());
+                out.push_str(&s[copied..inner_start]);
+                out.push_str(&mask_flag_values(word, depth + 1));
+                copied = inner_start + word.len();
+            }
+            i = end;
+            prev = word;
+            continue;
+        }
         let mut next = end;
         while next < b.len() && b[next].is_ascii_whitespace() {
             next += 1;
@@ -287,6 +365,38 @@ mod tests {
     }
 
     #[test]
+    fn hides_values_in_escaped_quotes() {
+        hides(r#"API_KEY=\"abc123 def456\" npm start"#, "def456");
+        hides(r#"tool --token=\"abc123 def456\" x"#, "def456");
+        hides(r#"tool --token \"abc123 def456\" x"#, "def456");
+        hides(r#"API_KEY="abc\"123 def456" npm start"#, "def456");
+        hides(r"PASSWORD=abc\ def456 npm start", "def456");
+    }
+
+    #[test]
+    fn hides_flags_inside_a_quoted_string() {
+        hides(r#"ssh host "mysql --password abc123def -e x""#, "abc123def");
+        hides(r#"ssh host 'tool --token abc123def'"#, "abc123def");
+        hides(r#"run "--password" "abc123def""#, "abc123def");
+        hides(r#"run \"tool --password abc123def\""#, "abc123def");
+        hides(r#"run "a 'b --password abc123def' c""#, "abc123def");
+    }
+
+    #[test]
+    fn hides_quoted_names_and_values() {
+        hides(r#"curl -d '{"password":"abc123def"}' x"#, "abc123def");
+        hides(r#"curl -d "{\"token\":\"abc123def\"}" x"#, "abc123def");
+        hides(r#"{"api_key": "abc123def"}"#, "abc123def");
+        hides(r#""api_key"="abc123def""#, "abc123def");
+        hides("password: abc123def", "abc123def");
+        hides("token := abc123def", "abc123def");
+        hides("Connect -Password:abc123def", "abc123def");
+        hides(r#"{"Authorization": "Basic abc123def"}"#, "abc123def");
+        hides(r#"curl -H Authorization:"Basic abc123def" x"#, "abc123def");
+        hides(r#"curl -H "Authorization: \"Basic abc123def\"" x"#, "abc123def");
+    }
+
+    #[test]
     fn hides_url_logins() {
         hides("git clone https://brett:abc123def@github.com/a/b.git", "abc123def");
         assert_eq!(redact("https://a:b@x.dev/path"), "https://•••@x.dev/path");
@@ -318,8 +428,28 @@ mod tests {
             "cargo build -p aiwidget",
             "npm run task-management-dashboard-long-name",
             "echo héllo wörld",
+            "docker run nginx:latest",
+            "py -c \"print('a: b')\"",
+            "dir C:\\Users\\brett\\x y",
+            "rust::path::to::thing",
+            "echo \"quoted words stay\" -- plain",
         ] {
             assert_eq!(redact(cmd), cmd);
+        }
+    }
+
+    /// This runs for every task at every refresh, on text up to 8 KB. The limit is loose so a
+    /// busy machine doesn't fail it: normal commands take microseconds.
+    #[test]
+    fn awkward_text_stays_cheap() {
+        for piece in [
+            "=\"", "a:", "token=\"", "token:\"", "--token \"", "\" ", "\"a b\" ", "'\" ", "\\\" ", "--x ", "://", "://@", "bearer ",
+            "authorization:", "authorization:\"", "a=", "sk-", "=", ":", "\\", " ", "\"--token ", "x.y.z.",
+        ] {
+            let text = piece.repeat(8 * 1024 / piece.len());
+            let started = std::time::Instant::now();
+            let _ = redact(&text);
+            assert!(started.elapsed().as_millis() < 200, "{piece:?} took {:?}", started.elapsed());
         }
     }
 
@@ -328,6 +458,8 @@ mod tests {
         for cmd in [
             r#"curl -H "Authorization: Bearer abc" https://a:b@x.dev?token=c --password d"#,
             "API_KEY=abc --token def sk-abcdefghijklmnopqrstuvwxyz",
+            r#"curl -d "{\"token\":\"abc\"}" \"tool --password def\" KEY=\"g h\""#,
+            r#"ssh host "mysql --password abc" 'x --token def'"#,
         ] {
             let once = redact(cmd);
             assert_eq!(redact(&once), once);
@@ -336,9 +468,17 @@ mod tests {
 
     #[test]
     fn copes_with_odd_text() {
-        for cmd in ["", "=", "==", "a=", "token=", "--token", "--token ", "token=\"unclosed", "://", "://@", "é=é", "Authorization:", "bearer ", "–token é"] {
-            let _ = redact(cmd);
+        for cmd in [
+            "", "=", "==", ":", "::", ":=", "a=", "token=", "token:", "--token", "--token ", "token=\"unclosed", "://", "://@", "é=é", "é:é",
+            "Authorization:", "bearer ", "–token é", "\\", "\"", "\\\"", "token=\\", "token=\\\"", "--token \\", "\"--token", "\"é \\",
+            "\"\"", "'' \"\"", "\\\"\\\"", "token:é\\é", "Authorization: \\",
+        ] {
+            let once = redact(cmd);
+            assert_eq!(redact(&once), once, "{cmd:?}");
         }
+        // Deep quote nesting has to stay quick and can't overflow the stack.
+        let deep = format!("{} --password abc", "\"' ".repeat(3000));
+        let _ = redact(&deep);
         hides("token=\"unclosed secret", "unclosed secret");
         hides("tool --password é€abc", "é€abc");
     }
