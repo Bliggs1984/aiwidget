@@ -363,7 +363,9 @@ pub fn describe(cmd: &str) -> String {
 
 fn describe_at(cmd: &str, depth: usize) -> String {
     let seg = first_real_segment(cmd);
-    let toks = tokenize(&seg);
+    // PowerShell's call operator: `& "C:\x\tool.exe" --flag` runs tool.exe.
+    let seg = seg.strip_prefix('&').map_or(seg.as_str(), str::trim_start);
+    let toks = tokenize(seg);
     let Some(first) = toks.first() else { return "Shell command".into() };
     let prog = prog_name(first);
     let args = &toks[1..];
@@ -524,7 +526,23 @@ fn describe_at(cmd: &str, depth: usize) -> String {
         "playwright" => Some("Running Playwright".into()),
         _ => None,
     };
-    d.unwrap_or_else(|| clip(&seg, 48))
+    // Unknown tool: name the program rather than echoing its command line.
+    d.unwrap_or_else(|| running_unknown(first, &prog))
+}
+
+/// Label for a program with no description of its own. The first word of a command isn't always
+/// a program (`for`, `(cd`, `NAME=value`, a masked value), and those get a generic label.
+fn running_unknown(first: &str, prog: &str) -> String {
+    const KEYWORDS: &[&str] = &["for", "foreach", "while", "until", "if", "case", "do", "try", "function", "select"];
+    let is_program = !first.contains('=')
+        && !KEYWORDS.contains(&prog)
+        && prog.chars().any(char::is_alphanumeric)
+        && prog.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | ' '));
+    if is_program {
+        format!("Running {}", clip(prog, 30))
+    } else {
+        "Shell command".into()
+    }
 }
 
 fn python_desc(args: &[String]) -> String {
@@ -598,7 +616,7 @@ mod tests {
 
     #[test]
     fn nested_shell_and_setup() {
-        assert_eq!(describe(r#"export PATH="$HOME/x:$PATH" && powershell -NoProfile -Command "Stop-Process -Name foo""#), "Stop-Process -Name foo");
+        assert_eq!(describe(r#"export PATH="$HOME/x:$PATH" && powershell -NoProfile -Command "Stop-Process -Name foo""#), "Running stop-process");
         assert_eq!(describe(r#"powershell -NoProfile -Command "Get-Process aiwidget""#), "Inspecting running processes");
         assert_eq!(without_setup("cd /c/x && export A=1 && cargo build"), "cargo build");
     }
@@ -615,7 +633,7 @@ EOF"), None);
     fn assignments_and_trailing_commands() {
         let e = effective_command("T='C:/x/Temp'; ./target/release/aiwidget.exe --snapshot out.bmp");
         assert!(e.starts_with("T='C:/x/Temp';"), "{e}");
-        assert_eq!(describe(&e), "./target/release/aiwidget.exe --snapshot out.bmp");
+        assert_eq!(describe(&e), "Running aiwidget");
         assert_eq!(effective_command(r"C:\Program Files\nodejs\node.exe server.js"), r"C:\Program Files\nodejs\node.exe server.js");
         assert_eq!(effective_command(r"C:\nodejs\node.exe server.js"), "node server.js");
         let c = r#"powershell -NoProfile -Command "\$p=Get-Process aiwidget; Start-Sleep 60"; tail -4 log.txt"#;
@@ -649,7 +667,38 @@ EOF"), None);
     }
 
     #[test]
-    fn fallback_is_clipped_command() {
-        assert_eq!(describe("weirdtool --flag"), "weirdtool --flag");
+    fn unknown_tools_show_the_program_not_the_command() {
+        assert_eq!(describe("weirdtool --flag secret-looking-value"), "Running weirdtool");
+        assert_eq!(describe(r#""C:\WINDOWS\System32\chcp.com" 65001 && dir"#), "Running chcp.com");
+    }
+
+    #[test]
+    fn powershell_call_operator_names_the_real_program() {
+        assert_eq!(describe(r#"& "C:\Program Files\Acme\my tool.exe" --flag x"#), "Running my tool");
+        assert_eq!(describe(r#"&"C:\x\tool.exe" --flag"#), "Running tool");
+        assert_eq!(describe("& cargo build"), "Compiling Rust");
+    }
+
+    #[test]
+    fn things_that_are_not_programs_get_a_generic_label() {
+        for cmd in [
+            "for f in a b; do weirdtool $f; done",
+            "if [ -f x ]; then weirdtool; fi",
+            "foreach ($x in $y) { weirdtool $x }",
+            "(cd x && weirdtool)",
+            "MY_VAR=hello",
+            "MY_VAR=some/path/value",
+            "$x = 'hello'",
+            "./",
+        ] {
+            assert_eq!(describe(cmd), "Shell command", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn masked_text_never_becomes_a_program_name() {
+        for cmd in ["TOKEN=abc123def", "sk-abcdefghijklmnopqrstuvwxyz --flag"] {
+            assert_eq!(describe(&redact(cmd)), "Shell command", "{cmd}");
+        }
     }
 }
