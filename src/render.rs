@@ -66,7 +66,6 @@ enum Font {
     Body,
     Small,
     SmallR,
-    Mono,
 }
 
 enum Op {
@@ -257,7 +256,6 @@ impl Renderer {
             (Font::Body, mk(ui, DWRITE_FONT_WEIGHT_NORMAL, 12.5, DWRITE_TEXT_ALIGNMENT_LEADING)?),
             (Font::Small, mk(ui, DWRITE_FONT_WEIGHT_NORMAL, 10.5, DWRITE_TEXT_ALIGNMENT_LEADING)?),
             (Font::SmallR, mk(ui, DWRITE_FONT_WEIGHT_NORMAL, 10.5, DWRITE_TEXT_ALIGNMENT_TRAILING)?),
-            (Font::Mono, mk("Cascadia Mono", DWRITE_FONT_WEIGHT_NORMAL, 9.5, DWRITE_TEXT_ALIGNMENT_LEADING)?),
         ];
         Ok(())
     }
@@ -353,12 +351,12 @@ impl Renderer {
                 y += 4.0;
                 let busy = (t.cpu / 20.0).min(1.0);
                 ops.push(Op::Rect {
-                    r: [PAD + 9.5, y + 3.0, 3.0, 27.0],
+                    r: [PAD + 9.5, y + 2.0, 3.0, 14.0],
                     radius: 1.5,
                     c: [color[0], color[1], color[2], 0.25 + 0.75 * busy],
                 });
                 if t.cpu > 1.0 {
-                    lights.push(Light { x: PAD + 11.0, y: y + 16.0, radius: 60.0, color, strength: 0.4 + 1.0 * busy });
+                    lights.push(Light { x: PAD + 11.0, y: y + 9.0, radius: 60.0, color, strength: 0.4 + 1.0 * busy });
                 }
                 let mut left = stats(&mut ops, right_edge, y + 2.0, t.cpu, t.mem, color, DIM);
                 if t.io > 512.0 * 1024.0 {
@@ -367,13 +365,13 @@ impl Renderer {
                     left -= iow + COL_GAP;
                     ops.push(Op::Text { s: io, font: Font::SmallR, r: [left, y + 2.0, iow, 15.0], c: DIM });
                 }
-                ops.push(Op::Text { s: t.title.clone(), font: Font::Body, r: [inner_x, y, left - inner_x - 6.0, 18.0], c: TEXT });
                 let age = fmt_age(t.age_s);
                 let aw = self.text_width(&age, Font::SmallR) + 4.0;
-                let detail = if t.procs > 1 { format!("{}  ({} procs, busiest {})", t.detail, t.procs, t.busiest) } else { t.detail.clone() };
-                ops.push(Op::Text { s: detail, font: Font::Mono, r: [inner_x, y + 18.0, right_edge - inner_x - aw - 6.0, 14.0], c: FAINT });
-                ops.push(Op::Text { s: age, font: Font::SmallR, r: [right_edge - aw, y + 17.0, aw, 14.0], c: FAINT });
-                y += 32.0;
+                left -= aw + COL_GAP;
+                ops.push(Op::Text { s: age, font: Font::SmallR, r: [left, y + 2.0, aw, 15.0], c: FAINT });
+                // Summary only. The full command stays in the debug log, never on the panel.
+                ops.push(Op::Text { s: t.title.clone(), font: Font::Body, r: [inner_x, y, left - inner_x - 6.0, 18.0], c: TEXT });
+                y += 20.0;
             }
             if s.tasks.len() > shown {
                 ops.push(Op::Text {
