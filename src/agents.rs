@@ -168,9 +168,6 @@ pub struct Task {
     pub mem: u64,
     pub io: f64,
     pub age_s: u64,
-    pub procs: usize,
-    /// Name of the process using the most CPU in this task's tree.
-    pub busiest: String,
     /// Every process in this task's tree, as (pid, start time). Console hosts are left out:
     /// they aren't the work.
     pub members: Vec<(u32, i64)>,
@@ -488,9 +485,8 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
         let (mut cpu, mut mem, mut io) = (own_cpu, own_mem, own_io);
         for h in heads {
             // Sum the subtree, stopping at nested agent sessions.
-            let (mut tcpu, mut tmem, mut tio, mut count) = (0f32, 0u64, 0f64, 0usize);
+            let (mut tcpu, mut tmem, mut tio) = (0f32, 0u64, 0f64);
             let mut members = Vec::new();
-            let mut busiest = (h, -1f32);
             let mut deepest_cmd_holder = h;
             let mut st = vec![(h, 0usize)];
             let mut max_depth = 0;
@@ -506,10 +502,6 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 tcpu += p.cpu;
                 tmem += p.mem;
                 tio += p.io;
-                count += 1;
-                if p.cpu > busiest.1 && !SKIP_NAMES.contains(&names[n].as_str()) {
-                    busiest = (n, p.cpu);
-                }
                 if d > max_depth && !SHELLS.contains(&names[n].as_str()) && !SKIP_NAMES.contains(&names[n].as_str()) {
                     max_depth = d;
                     deepest_cmd_holder = n;
@@ -561,8 +553,6 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 mem: tmem,
                 io: tio,
                 age_s: age_secs(now, hp.create_time),
-                procs: count,
-                busiest: procs_list[busiest.0].name.trim_end_matches(".exe").to_string(),
                 members,
             });
         }
