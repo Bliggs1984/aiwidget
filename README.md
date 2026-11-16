@@ -1,4 +1,4 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.png" width="64" height="64" alt="">
 
 # AIWidget
 
@@ -65,7 +65,23 @@ Speed comes first, so there is no GPU use, no animation loop and no background t
 
 ## Use
 
-Run `target\release\aiwidget.exe`.
+Run `target\release\aiwidget.exe`, or open **AIWidget** from the Start menu. Running it twice does
+nothing, because only one copy runs at a time.
+
+To open it whenever a Claude session starts in T3 Code, add this to `hooks` in
+`%USERPROFILE%\.claude\settings.json`. Going through `explorer.exe` means the widget isn't part of
+Claude's process tree, so closing the session doesn't close the widget.
+
+```json
+"SessionStart": [
+  {
+    "matcher": "startup|resume",
+    "hooks": [
+      { "type": "command", "command": "[ -n \"$T3CODE_THREAD_ID\" ] && explorer.exe 'C:\\Utils\\AIstuff\\aiwidget\\target\\release\\aiwidget.exe' >/dev/null 2>&1; exit 0" }
+    ]
+  }
+]
+```
 
 - **Drag** it anywhere. It remembers the spot.
 - **Right-click** for: Screen, Corner, Layer (behind windows or always on top), Size,
