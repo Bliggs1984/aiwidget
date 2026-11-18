@@ -5,6 +5,12 @@
 A small see-through panel on your desktop that shows which AI agents are running, what each
 one has started, and how much CPU and memory that work uses.
 
+<img src="assets/screenshot.png" width="469" alt="AIWidget panel showing Codex and Claude Code. Under Claude Code, a Rust build (cargo › rustc) and a Python script running FFmpeg, each with CPU, memory and disk use">
+
+**Download:** [AIWidget.exe](https://github.com/Bliggs1984/aiwidget/releases/latest/download/AIWidget.exe)
+(Windows 10 or 11, 64-bit, one file, nothing to install). Windows may warn that it's unsigned:
+click **More info**, then **Run anyway**.
+
 - **Agents it recognises:** Claude Code, Codex, Gemini CLI, OpenCode, Copilot CLI, Aider,
   Cursor Agent, Amp, Goose, Qwen Code, Droid. It also shows the app hosting each one (T3 Code,
   Codex app, VS Code, Terminal and so on) and the project folder.
