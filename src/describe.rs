@@ -309,6 +309,65 @@ fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// True for programs whose label is the script they run, so their command line is worth reading.
+pub fn is_interpreter(exe: &str) -> bool {
+    matches!(
+        prog_name(exe).as_str(),
+        "py" | "python" | "python3" | "pythonw" | "node" | "bun" | "deno" | "ruby" | "perl" | "php" | "bash" | "sh" | "zsh"
+    )
+}
+
+/// A script file named in a command: a token ending in a script extension. Anything else,
+/// such as a flag's value, is never taken for one.
+fn script_in(toks: &[String]) -> Option<String> {
+    const EXTS: &[&str] = &[".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".rb", ".pl", ".php", ".sh", ".bash", ".exe"];
+    for (i, a) in toks.iter().enumerate() {
+        if matches!(a.as_str(), "-c" | "-e" | "-p" | "--eval" | "--print" | "-") {
+            return None;
+        }
+        // `python -m pytest`
+        if a == "-m" {
+            return toks.get(i + 1).filter(|m| !m.starts_with('-')).cloned();
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        let base = file_base(a.trim_end_matches(['"', '\'', '\\']).trim_start_matches(['"', '\'']));
+        let lower = base.to_ascii_lowercase();
+        if EXTS.iter().any(|e| lower.len() > e.len() && lower.ends_with(e)) {
+            // `python ...\Scripts\pip.exe install`: the launcher's name is the tool.
+            return Some(base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(&base).to_string());
+        }
+    }
+    None
+}
+
+/// One or two words for a process inside a task, for the "↳ script.py › ffmpeg" line: the
+/// script an interpreter runs, otherwise the program's name. A shell with no script file gets
+/// none. `cmd` is only called for interpreters, and its text should already be masked.
+pub fn work_label(exe: &str, cmd: impl FnOnce() -> Option<String>) -> Option<String> {
+    let prog = prog_name(exe);
+    if is_interpreter(exe) {
+        let toks = cmd().map(|c| tokenize(&c)).unwrap_or_default();
+        if let Some(s) = toks.get(1..).and_then(script_in) {
+            // npm and npx run their own script; the title already says what they do.
+            if matches!(s.as_str(), "npm-cli.js" | "npx-cli.js") {
+                return None;
+            }
+            return Some(clip(&s, 30));
+        }
+        if matches!(prog.as_str(), "bash" | "sh" | "zsh") {
+            return None;
+        }
+    }
+    // Cargo's test binaries carry a hash: `aiwidget-3f9c2e1b7a6d5c4e`.
+    let prog = match prog.rsplit_once('-') {
+        Some((name, hash)) if hash.len() == 16 && hash.bytes().all(|c| c.is_ascii_hexdigit()) => name.to_string(),
+        _ => prog,
+    };
+    Some(clip(&prog, 30))
+}
+
 /// Name of an MCP server if this command line looks like one.
 pub fn mcp_name(cmd: &str) -> Option<String> {
     // Only the program and its first two non-flag arguments count, so a long script that
@@ -456,6 +515,8 @@ fn describe_at(cmd: &str, depth: usize) -> String {
         "rustc" => Some("Compiling Rust".into()),
         "rustup" | "rustup-init" => Some("Updating Rust toolchain".into()),
         "py" | "python" | "python3" | "pythonw" => Some(python_desc(args)),
+        // `bash script.sh` (the `-c` form was unwrapped above).
+        "bash" | "sh" | "zsh" => script_in(args).filter(|s| !s.is_empty()).map(|s| format!("Shell script: {}", clip(&s, 30))),
         "uv" | "uvx" => Some(match sub.as_str() {
             "pip" | "add" | "sync" => "Installing Python packages".into(),
             "run" => python_desc(&args[1..]),
@@ -664,6 +725,38 @@ EOF"), None);
     fn long_commands_are_cut_safely_inside_a_multibyte_character() {
         let cmd = "é".repeat(MAX_COMMAND_BYTES);
         assert!(effective_command(&cmd).len() <= MAX_COMMAND_BYTES);
+    }
+
+    #[test]
+    fn work_labels_name_the_script_or_the_program() {
+        let l = |exe: &str, cmd: &str| work_label(exe, || Some(cmd.to_string()));
+        assert_eq!(l("python.exe", "C:\\Py\\python.exe -u tools\\encode.py --fast").as_deref(), Some("encode.py"));
+        assert_eq!(l("python.exe", "python -m pytest -q").as_deref(), Some("pytest"));
+        assert_eq!(l("python.exe", "python -c \"print(1)\"").as_deref(), Some("python"));
+        assert_eq!(l("python.exe", "python C:\\venv\\Scripts\\pip.exe install x").as_deref(), Some("pip"));
+        assert_eq!(l("node.exe", "node C:\\npm\\bin\\npm-cli.js run dev"), None);
+        assert_eq!(l("bash.exe", "bash -c \"ls\""), None);
+        assert_eq!(l("bash.exe", "bash scripts/deploy.sh").as_deref(), Some("deploy.sh"));
+        assert_eq!(l("aiwidget-3f9c2e1b7a6d5c4e.exe", "x").as_deref(), Some("aiwidget"));
+        assert_eq!(work_label("node.exe", || None).as_deref(), Some("node"));
+        // The command line isn't read for programs labelled by name alone.
+        assert_eq!(work_label("ffmpeg.exe", || panic!("not needed")).as_deref(), Some("ffmpeg"));
+    }
+
+    #[test]
+    fn a_flag_value_is_never_taken_for_a_script() {
+        let l = |exe: &str, cmd: &str| work_label(exe, || Some(cmd.to_string()));
+        assert_eq!(l("node.exe", "node -p SECRET.value app.js").as_deref(), Some("node"));
+        assert_eq!(l("python.exe", "python -X SECRET.abc a.py").as_deref(), Some("a.py"));
+        assert_eq!(l("node.exe", "node -r dotenv/config app.js").as_deref(), Some("app.js"));
+    }
+
+    #[test]
+    fn shell_scripts_are_named() {
+        assert_eq!(describe("bash C:/x/scripts/save-session.sh --quiet"), "Shell script: save-session.sh");
+        assert_eq!(describe("bash \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-hook.sh\\\""), "Shell script: post-tool-hook.sh");
+        assert_eq!(describe("bash \"\\\""), "Running bash");
+        assert_eq!(describe("bash"), "Running bash");
     }
 
     #[test]

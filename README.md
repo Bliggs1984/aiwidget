@@ -10,7 +10,9 @@ one has started, and how much CPU and memory that work uses.
   Codex app, VS Code, Terminal and so on) and the project folder.
 - **Per task:** a short description ("Compiling Rust", "Searching files for "foo"", "Dev
   server (npm dev)"), CPU %, memory, disk speed when busy, and how long it has run. The full
-  command isn't shown on the panel. MCP servers are grouped on one line. Finished tasks stay for 20 seconds as "done".
+  command isn't shown on the panel. When the work happens further down (a Python script that
+  starts FFmpeg), a second line names the programs in between by name only: `↳ encode.py › ffmpeg`.
+  MCP servers are grouped on one line. Finished tasks stay for 20 seconds as "done".
 - **Icons:** a chip that fills from the bottom shows CPU, and a memory stick with four chips
   shows memory. Each has four steps, with the exact number beside it:
 
