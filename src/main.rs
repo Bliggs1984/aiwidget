@@ -123,7 +123,7 @@ impl App {
             for s in &self.sessions {
                 debug_log(&format!("  {:?} pid {} {:?} host {:?} cpu {:.1} mem {} tasks {} mcps {}", s.kind, s.root_pid, s.project, s.host, s.cpu, s.mem / 1048576, s.tasks.len(), s.mcps.len()));
                 for t in &s.tasks {
-                    debug_log(&format!("     - {} | {}", t.title, t.detail.chars().take(100).collect::<String>()));
+                    debug_log(&format!("     - {} [{}] | {}", t.title, t.chain, t.detail.chars().take(100).collect::<String>()));
                 }
             }
         }

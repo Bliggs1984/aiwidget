@@ -372,6 +372,11 @@ impl Renderer {
                 // Summary only. The full command stays in the debug log, never on the panel.
                 ops.push(Op::Text { s: t.title.clone(), font: Font::Body, r: [inner_x, y, left - inner_x - 6.0, 18.0], c: TEXT });
                 y += 20.0;
+                // What it's running underneath, by program name only.
+                if !t.chain.is_empty() {
+                    ops.push(Op::Text { s: format!("↳ {}", t.chain), font: Font::Small, r: [inner_x + 8.0, y - 2.0, right_edge - inner_x - 8.0, 14.0], c: FAINT });
+                    y += 14.0;
+                }
             }
             if s.tasks.len() > shown {
                 ops.push(Op::Text {

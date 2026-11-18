@@ -163,6 +163,9 @@ pub struct Task {
     pub pid: u32,
     pub create_time: i64,
     pub title: String,
+    /// The programs between the command and the one doing the work, e.g. "encode.py › ffmpeg".
+    /// Empty when the title already says it all.
+    pub chain: String,
     pub detail: String,
     pub cpu: f32,
     pub mem: u64,
@@ -212,6 +215,30 @@ struct Cached {
     console: Retried<u32>,
     /// The session this process was last counted under: agent (pid, start time).
     owner: Option<(u32, i64)>,
+    /// For a task's head: the "↳" line last shown under it.
+    shown: Option<Shown>,
+}
+
+/// The "↳" line of a task, kept between ticks so it stays put while the work goes on.
+#[derive(Clone, Debug)]
+struct Shown {
+    /// The process it ends at, (pid, start time).
+    worker: (u32, i64),
+    chain: String,
+    /// Ticks in a row with nothing busy.
+    idle: u8,
+}
+
+/// Ticks the line stays after the work goes quiet (10 seconds at the default speed).
+const HOLD_TICKS: u8 = 5;
+
+/// The busiest process wins, but the one shown last time stays while it is at least half as
+/// busy, so two processes taking turns don't swap the line every tick.
+fn pick_worker(busiest: Option<(usize, f32)>, prev: Option<(usize, f32)>) -> Option<usize> {
+    match (busiest, prev) {
+        (Some((b, bc)), Some((p, pc))) => Some(if bc > 2.0 * pc { b } else { p }),
+        (b, _) => b.map(|(n, _)| n),
+    }
 }
 
 /// A read that may not be ready the moment a process appears (or may not apply to it yet),
@@ -272,6 +299,12 @@ impl InfoCache {
     }
     fn set_owner(&mut self, p: &Proc, owner: (u32, i64)) {
         self.map.entry((p.pid, p.create_time)).or_default().owner = Some(owner);
+    }
+    fn shown(&self, p: &Proc) -> Option<&Shown> {
+        self.map.get(&(p.pid, p.create_time)).and_then(|e| e.shown.as_ref())
+    }
+    fn set_shown(&mut self, p: &Proc, s: Option<Shown>) {
+        self.map.entry((p.pid, p.create_time)).or_default().shown = s;
     }
     /// Drop entries for processes that no longer exist. Returns the ones that do.
     pub fn retain_live(&mut self, live: &[Proc]) -> HashSet<(u32, i64)> {
@@ -488,6 +521,11 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
             let (mut tcpu, mut tmem, mut tio) = (0f32, 0u64, 0f64);
             let mut members = Vec::new();
             let mut deepest_cmd_holder = h;
+            // The process doing the work: the busiest real program using at least 1% CPU.
+            // The one picked last time is kept while it stays busy (see `pick_worker`).
+            let mut worker: Option<(usize, f32, usize, i64)> = None;
+            let prev_worker = cache.shown(&procs_list[h]).map(|s| s.worker);
+            let mut prev_busy: Option<(usize, f32)> = None;
             let mut st = vec![(h, 0usize)];
             let mut max_depth = 0;
             while let Some((n, d)) = st.pop() {
@@ -505,6 +543,14 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 if d > max_depth && !SHELLS.contains(&names[n].as_str()) && !SKIP_NAMES.contains(&names[n].as_str()) {
                     max_depth = d;
                     deepest_cmd_holder = n;
+                }
+                if p.cpu >= 1.0 && !SHELLS.contains(&names[n].as_str()) && !SKIP_NAMES.contains(&names[n].as_str()) {
+                    if prev_worker == Some((p.pid, p.create_time)) {
+                        prev_busy = Some((n, p.cpu));
+                    }
+                    if worker.is_none_or(|(_, wb, wd, wt)| (p.cpu, d, p.create_time) > (wb, wd, wt)) {
+                        worker = Some((n, p.cpu, d, p.create_time));
+                    }
                 }
                 for &c in &children[n] {
                     if !is_root(c) {
@@ -544,10 +590,38 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
                 .or_else(|| hooks.iter().find(|(c, _)| eff.contains(c.as_str()) && c.len() > 8).map(|(_, d)| d))
                 .map(|d| redact(d))
                 .unwrap_or_else(|| redact(&describe::describe(&shown)));
+            let title_prog = describe::tokenize(&describe::without_setup(&shown)).first().map(|t| describe::prog_name(t)).unwrap_or_default();
+            let worker = pick_worker(worker.map(|(n, c, ..)| (n, c)), prev_busy);
+            let chain = match worker {
+                Some(w) => {
+                    let wp = &procs_list[w];
+                    let same = prev_worker == Some((wp.pid, wp.create_time));
+                    let chain = match cache.shown(&procs_list[h]) {
+                        Some(s) if same => s.chain.clone(),
+                        _ => work_chain(w, h, &parent, procs_list, &names, cache, &title, &title_prog),
+                    };
+                    cache.set_shown(&procs_list[h], Some(Shown { worker: (wp.pid, wp.create_time), chain: chain.clone(), idle: 0 }));
+                    chain
+                }
+                // Nothing busy: keep the last line for a few ticks so it doesn't blink.
+                None => match cache.shown(&procs_list[h]).cloned() {
+                    Some(mut s) if s.idle < HOLD_TICKS => {
+                        s.idle += 1;
+                        let chain = s.chain.clone();
+                        cache.set_shown(&procs_list[h], Some(s));
+                        chain
+                    }
+                    _ => {
+                        cache.set_shown(&procs_list[h], None);
+                        String::new()
+                    }
+                },
+            };
             tasks.push(Task {
                 pid: hp.pid,
                 create_time: hp.create_time,
                 title,
+                chain,
                 detail: describe::without_setup(&shown).split_whitespace().collect::<Vec<_>>().join(" "),
                 cpu: tcpu,
                 mem: tmem,
@@ -630,6 +704,56 @@ pub fn build_sessions(procs_list: &[Proc], cache: &mut InfoCache, hooks: &HookDe
     }
     sessions.sort_by(|a, b| a.create_time.cmp(&b.create_time));
     sessions
+}
+
+/// Names the programs from a task's head down to `worker`, skipping console hosts and shells
+/// that run no script file, e.g. "encode.py › ffmpeg". Leading names the title already gives
+/// are left out (the program it was described from, or a name it contains), and so is a repeat
+/// (the `py` launcher and the python it starts run the same script). At most the last three.
+#[allow(clippy::too_many_arguments)]
+fn work_chain(
+    worker: usize,
+    head: usize,
+    parent: &[Option<usize>],
+    list: &[Proc],
+    names: &[String],
+    cache: &mut InfoCache,
+    title: &str,
+    title_prog: &str,
+) -> String {
+    let mut path = vec![worker];
+    let mut cur = worker;
+    while cur != head {
+        match parent[cur] {
+            Some(p) if path.len() < 16 => {
+                path.push(p);
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    let title_lc = title.to_ascii_lowercase();
+    let mut labels: Vec<String> = Vec::new();
+    for &n in path.iter().rev() {
+        if SKIP_NAMES.contains(&names[n].as_str()) {
+            continue;
+        }
+        let Some(label) = describe::work_label(&list[n].name, || cache.cmd(&list[n]).map(redact)) else { continue };
+        if label.is_empty() || labels.last() == Some(&label) {
+            continue;
+        }
+        labels.push(label);
+    }
+    // Drop the leading names the title already gives ("Python script: encode.py", or `cargo`
+    // under "Compiling Rust").
+    while labels.first().is_some_and(|l| {
+        let l = l.to_ascii_lowercase();
+        l == title_prog || title_lc.contains(&l)
+    }) {
+        labels.remove(0);
+    }
+    let skip = labels.len().saturating_sub(3);
+    labels[skip..].join(" › ")
 }
 
 /// T3 Code scratch folders look like `2026-11-02-fix-the-thing-f684b4d7`; show `fix the thing`.
@@ -717,6 +841,7 @@ mod tests {
                     env: Retried { value: Some(EnvInfo { agent_pid: s.agent_pid, git_bash: s.git_bash }), misses: 0 },
                     console: Retried { value: s.console, misses: Retried::<u32>::MAX_MISSES },
                     owner: None,
+                    shown: None,
                 },
             );
         }
@@ -831,6 +956,103 @@ mod tests {
 
     fn task(s: &Session, pid: u32) -> &Task {
         s.tasks.iter().find(|t| t.pid == pid).unwrap()
+    }
+
+    fn sessions_with_cmds(list: &[Proc], cmds: &[(u32, &str)]) -> Vec<Session> {
+        let mut cache = InfoCache::default();
+        seed(&mut cache, list, &[]);
+        for &(pid, cmd) in cmds {
+            let p = list.iter().find(|p| p.pid == pid).unwrap();
+            cache.map.get_mut(&(p.pid, p.create_time)).unwrap().cmd = Some(Some(cmd.to_string()));
+        }
+        build_sessions(list, &mut cache, &HashMap::new(), 0)
+    }
+
+    #[test]
+    fn a_script_names_the_program_it_started() {
+        // claude > bash > py launcher > python > ffmpeg, with ffmpeg doing the work.
+        let list = vec![
+            p(CLAUDE, 1, "claude.exe", 1, 0.0),
+            p(200, CLAUDE, "bash.exe", 200, 0.0),
+            p(300, 200, "py.exe", 300, 0.0),
+            p(400, 300, "python.exe", 400, 0.2),
+            p(500, 400, "ffmpeg.exe", 500, 40.0),
+        ];
+        let cmds = [
+            (200, "bash -c \"sed -i s/a/b/ x.txt && py encode.py\""),
+            (300, "py encode.py"),
+            (400, "C:\\Python\\python.exe encode.py"),
+            (500, "ffmpeg -i in.mp4 -c:v libx264 out.mp4"),
+        ];
+        let s = sessions_with_cmds(&list, &cmds);
+        assert_eq!(task(&s[0], 200).chain, "encode.py › ffmpeg");
+
+        // Run straight from the agent, the title already names the script.
+        let s = sessions_with_cmds(&list, &[(200, "bash -c \"py encode.py\""), cmds[1], cmds[2], cmds[3]]);
+        assert_eq!(task(&s[0], 200).title, "Python script: encode.py");
+        assert_eq!(task(&s[0], 200).chain, "ffmpeg");
+    }
+
+    #[test]
+    fn the_program_the_title_names_is_not_repeated_and_idle_helpers_are_not_shown() {
+        let list = vec![
+            p(CLAUDE, 1, "claude.exe", 1, 0.0),
+            p(200, CLAUDE, "bash.exe", 200, 0.0),
+            p(300, 200, "cargo.exe", 300, 0.5),
+            p(400, 300, "rustc.exe", 400, 30.0),
+            p(210, CLAUDE, "bash.exe", 210, 0.0),
+            p(310, 210, "git.exe", 310, 0.0),
+            p(410, 310, "git-remote-https.exe", 410, 0.3),
+        ];
+        let s = sessions_with_cmds(&list, &[(200, "bash -c \"cargo build --release\""), (210, "bash -c \"git push\"")]);
+        assert_eq!(task(&s[0], 200).chain, "rustc");
+        assert_eq!(task(&s[0], 210).chain, "");
+    }
+
+    #[test]
+    fn the_line_holds_steady_while_the_work_goes_on() {
+        let base = |py: f32, ff: f32, magick: f32| {
+            vec![
+                p(CLAUDE, 1, "claude.exe", 1, 0.0),
+                p(200, CLAUDE, "bash.exe", 200, 0.0),
+                p(300, 200, "python.exe", 300, py),
+                p(400, 300, "ffmpeg.exe", 400, ff),
+                p(410, 300, "magick.exe", 410, magick),
+            ]
+        };
+        let mut cache = InfoCache::default();
+        let mut tick = |list: &[Proc]| {
+            seed_missing(&mut cache, list, &[(200, "bash -c \"python build_all.py\""), (300, "python build_all.py")]);
+            task(&build_sessions(list, &mut cache, &HashMap::new(), 0)[0], 200).chain.clone()
+        };
+        assert_eq!(tick(&base(0.5, 20.0, 15.0)), "ffmpeg");
+        // magick a little busier: the line stays on ffmpeg.
+        assert_eq!(tick(&base(0.5, 12.0, 18.0)), "ffmpeg");
+        // magick far busier: it moves.
+        assert_eq!(tick(&base(0.5, 3.0, 18.0)), "magick");
+        // A quiet moment keeps the line for a few ticks, then it goes.
+        for _ in 0..HOLD_TICKS {
+            assert_eq!(tick(&base(0.5, 0.0, 0.0)), "magick");
+        }
+        assert_eq!(tick(&base(0.5, 0.0, 0.0)), "");
+    }
+
+    /// Like `seed`, but keeps what is already cached, as the real cache does between ticks.
+    fn seed_missing(cache: &mut InfoCache, list: &[Proc], cmds: &[(u32, &str)]) {
+        let fresh: Vec<Proc> = list.iter().filter(|p| !cache.map.contains_key(&(p.pid, p.create_time))).cloned().collect();
+        seed(cache, &fresh, &[]);
+        for &(pid, cmd) in cmds {
+            let p = list.iter().find(|p| p.pid == pid).unwrap();
+            cache.map.get_mut(&(p.pid, p.create_time)).unwrap().cmd = Some(Some(cmd.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_command_with_nothing_underneath_gets_no_extra_line() {
+        let list = vec![p(CLAUDE, 1, "claude.exe", 1, 0.0), p(200, CLAUDE, "bash.exe", 200, 0.0), p(300, 200, "ffmpeg.exe", 300, 30.0)];
+        let s = sessions_with_cmds(&list, &[(200, "bash -c \"ffmpeg -i a.mp4 b.mp4\""), (300, "ffmpeg -i a.mp4 b.mp4")]);
+        assert_eq!(task(&s[0], 200).title, "Processing media (ffmpeg)");
+        assert_eq!(task(&s[0], 200).chain, "");
     }
 
     /// The real shape: Git Bash's script process has a dead parent and no CLAUDE_PID, but shares
