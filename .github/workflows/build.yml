@@ -1,0 +1,76 @@
+# Builds and tests AIWidget on Windows for every pull request and push to main.
+# Pushing a version tag (e.g. v0.2.0) also publishes a GitHub Release with AIWidget.exe attached,
+# which is the file the README's "Download" link points to.
+#
+# To release: bump `version` in Cargo.toml, merge, then
+#   git tag v0.2.0 && git push origin v0.2.0
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p out
+          cp target/release/aiwidget.exe out/AIWidget.exe
+          sha256sum out/AIWidget.exe | cut -d' ' -f1 | tr a-f A-F > out/AIWidget.exe.sha256
+          ls -la out && cat out/AIWidget.exe.sha256
+
+      # Kept for 14 days on every run, so a build can be downloaded and tried before releasing it.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AIWidget
+          path: out/AIWidget.exe
+          retention-days: 14
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "aiwidget") | .version')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version. Bump the version in Cargo.toml first."
+            exit 1
+          fi
+          sha=$(cat out/AIWidget.exe.sha256)
+          cat > notes.md <<NOTES
+          A small see-through desktop panel that shows which AI coding agents are running (Claude Code, Codex, Gemini CLI, OpenCode, Copilot CLI, Aider, Cursor Agent and others), what each one has started, and how much CPU and memory that work uses.
+
+          **Download \`AIWidget.exe\` below and double-click it.** It's a single file with nothing to install. It needs 64-bit Windows 10 or 11.
+
+          - Windows may say "Windows protected your PC" because the app isn't signed. Click **More info**, then **Run anyway**.
+          - Drag the panel anywhere. Right-click it for settings and **Close**.
+          - It sends nothing over the network. It only saves its own settings, in \`%APPDATA%\\aiwidget\\config.json\`.
+
+          SHA-256: \`$sha\`
+          NOTES
+          gh release create "$TAG" out/AIWidget.exe --title "AIWidget $version" --notes-file notes.md --verify-tag
